@@ -1,0 +1,4 @@
+interface:
+  display_name: "Inference Performance Test"
+  short_description: "Run repeatable inference benchmarks."
+  default_prompt: "Run a standardized performance test for this inference framework."

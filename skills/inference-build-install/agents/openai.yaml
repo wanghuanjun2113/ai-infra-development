@@ -1,0 +1,4 @@
+interface:
+  display_name: "Inference Build Install"
+  short_description: "Build and install inference frameworks."
+  default_prompt: "Build and install this inference framework."

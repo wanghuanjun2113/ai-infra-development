@@ -1,0 +1,4 @@
+interface:
+  display_name: "Inference Performance Optimization"
+  short_description: "Optimize inference framework performance."
+  default_prompt: "Optimize this inference framework performance issue."

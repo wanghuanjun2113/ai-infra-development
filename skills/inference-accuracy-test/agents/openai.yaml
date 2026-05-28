@@ -1,0 +1,4 @@
+interface:
+  display_name: "Inference Accuracy Test"
+  short_description: "Run repeatable inference accuracy tests."
+  default_prompt: "Run a standardized accuracy test for this inference framework."

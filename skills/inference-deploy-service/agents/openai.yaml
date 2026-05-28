@@ -1,0 +1,4 @@
+interface:
+  display_name: "Inference Deploy Service"
+  short_description: "Deploy inference services reliably."
+  default_prompt: "Deploy this inference framework service."

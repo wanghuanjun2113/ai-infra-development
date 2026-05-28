@@ -1,0 +1,4 @@
+interface:
+  display_name: "Inference Bugfix"
+  short_description: "Diagnose and fix inference bugs."
+  default_prompt: "Diagnose and fix this inference framework issue."

@@ -1,0 +1,3 @@
+display_name: Inference Framework Router
+short_description: Route inference framework tasks.
+default_prompt: Route this inference framework task to the right framework and skill.

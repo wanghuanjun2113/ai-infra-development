@@ -1,0 +1,78 @@
+current_framework: xllm
+
+frameworks:
+  xllm:
+    enabled: true
+    path: code/xllm
+    adapter: frameworks/xllm.md
+    git:
+      origin: https://github.com/wanghuanjun2113/xllm.git
+      upstream: https://github.com/jd-opensource/xllm.git
+      branch: preview/qwen3.5-qwen3.6
+      commit: cfc94a06
+
+  vllm-ascend:
+    enabled: false
+    path: code/vllm-ascend
+    adapter: frameworks/vllm-ascend.md
+    git:
+      origin: git@github.com:your-org/vllm-ascend.git
+      branch: main
+
+  sglang:
+    enabled: false
+    path: code/sglang
+    adapter: frameworks/sglang.md
+    git:
+      origin: git@github.com:your-org/sglang.git
+      branch: main
+
+models:
+  qwen35_27b:
+    path: /home/data/weights/Qwen35-27B
+    draft_model_path: /home/data/weights/Qwen35-27B-mtp
+
+datasets:
+  ceval:
+    path: /shared/inference/datasets/ceval
+  mmlu:
+    path: /shared/inference/datasets/mmlu
+
+
+
+deploy:
+  xllm:
+    start_port: 18150
+    nnodes: 2
+    max_memory_utilization: 0.7
+    max_tokens_per_batch: 32768
+    max_seqs_per_batch: 16
+    block_size: 128
+    communication_backend: lccl
+    max_tokens_per_chunk_for_prefill: 256
+    max_concurrent_requests: 30
+    speculative_tokens: 2
+
+benchmark:
+  model: qwen35_27b
+  cases:
+    - name: smoke
+      input_len: 1024
+      output_len: 128
+      concurrency: 1
+      num_prompts: 16
+
+    - name: throughput
+      input_len: 1024
+      output_len: 128
+      concurrency: 16
+      num_prompts: 256
+
+accuracy:
+  model: qwen35_27b
+  cases:
+    - name: ceval
+      dataset: ceval
+
+    - name: mmlu
+      dataset: mmlu

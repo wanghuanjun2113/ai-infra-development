@@ -1,0 +1,12 @@
+/code/
+/runs/
+/profiling/
+/logs/
+/tmp/
+
+*.log
+*.pyc
+__pycache__/
+.pytest_cache/
+.env
+.venv/

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Inference Code Review"
+  short_description: "Review inference framework changes."
+  default_prompt: "Review this inference framework change."
