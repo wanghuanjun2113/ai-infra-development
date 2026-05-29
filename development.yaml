@@ -51,7 +51,7 @@ deploy:
     communication_backend: lccl
     max_tokens_per_chunk_for_prefill: 256
     max_concurrent_requests: 30
-    speculative_tokens: 2
+    speculative_tokens: 0
 
 benchmark:
   model: qwen35_27b

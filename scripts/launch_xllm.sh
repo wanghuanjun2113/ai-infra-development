@@ -29,6 +29,13 @@ NUM_SPECULATIVE_TOKENS=2
 GIT_BRANCH="unknown"
 GIT_COMMIT="unknown"
 LAUNCH_LOG=""
+HEALTHCHECK_TIMEOUT_SECONDS=1800
+HEALTHCHECK_INTERVAL_SECONDS=5
+SMOKE_TEST_TIMEOUT_SECONDS=120
+DEPLOY_STATUS="INCONCLUSIVE"
+HEALTHCHECK_STATUS="NOT_RUN"
+SMOKE_TEST_STATUS="NOT_RUN"
+SERVICE_MODEL_ID=""
 
 log() {
   local message
@@ -279,6 +286,8 @@ print_config_summary() {
   log "  visible_devices=$VISIBLE_DEVICES"
   log "  start_device=$START_DEVICE start_port=$START_PORT nnodes=$NNODES"
   log "  master_node_addr=$MASTER_NODE_ADDR hccl_if_base_port=$HCCL_IF_BASE_PORT"
+  log "  healthcheck_timeout_seconds=$HEALTHCHECK_TIMEOUT_SECONDS"
+  log "  smoke_test_timeout_seconds=$SMOKE_TEST_TIMEOUT_SECONDS"
   log "  run_dir=$RUN_DIR"
 }
 
@@ -381,6 +390,7 @@ select_idle_devices() {
 write_manifest() {
   local manifest="$LOG_DIR/manifest.json"
   local repo_json branch_json commit_json model_json model_path_json draft_json bin_json visible_json start_device_json start_port_json nnodes_json master_json run_json
+  local status_json health_json smoke_json service_model_json
 
   repo_json="$(printf '%s' "$REPO_PATH" | json_escape)"
   branch_json="$(printf '%s' "$GIT_BRANCH" | json_escape)"
@@ -395,6 +405,10 @@ write_manifest() {
   nnodes_json="$(printf '%s' "$NNODES" | json_escape)"
   master_json="$(printf '%s' "$MASTER_NODE_ADDR" | json_escape)"
   run_json="$(printf '%s' "$RUN_DIR" | json_escape)"
+  status_json="$(printf '%s' "$DEPLOY_STATUS" | json_escape)"
+  health_json="$(printf '%s' "$HEALTHCHECK_STATUS" | json_escape)"
+  smoke_json="$(printf '%s' "$SMOKE_TEST_STATUS" | json_escape)"
+  service_model_json="$(printf '%s' "$SERVICE_MODEL_ID" | json_escape)"
 
   cat > "$manifest" <<EOF
 {
@@ -409,9 +423,12 @@ write_manifest() {
   "repo": "$repo_json",
   "run_dir": "$run_json",
   "server_bin": "$bin_json",
+  "service_model_id": "$service_model_json",
   "start_device": "$start_device_json",
   "start_port": "$start_port_json",
-  "status": "INCONCLUSIVE",
+  "status": "$status_json",
+  "healthcheck_status": "$health_json",
+  "smoke_test_status": "$smoke_json",
   "task": "deploy",
   "visible_devices": "$visible_json"
 }
@@ -424,7 +441,7 @@ write_report() {
 
 ## Verdict
 
-INCONCLUSIVE
+$DEPLOY_STATUS
 
 ## Context
 
@@ -438,6 +455,11 @@ INCONCLUSIVE
 - Start port: $START_PORT
 - Nodes: $NNODES
 - Run directory: $RUN_DIR
+- Health check: $HEALTHCHECK_STATUS
+- Smoke test: $SMOKE_TEST_STATUS
+- Service model id: ${SERVICE_MODEL_ID:-unknown}
+- Health check log: $LOG_DIR/healthcheck.log
+- Smoke test log: $LOG_DIR/smoke_test.log
 EOF
 }
 
@@ -508,8 +530,10 @@ setup_environment() {
   export INF_NAN_MODE_FORCE_DISABLE=1
   export PROFILING_MODE=dynamic
   export HCCL_IF_BASE_PORT="$HCCL_IF_BASE_PORT"
+  export TRITON_BINARY_PATH="$REPO_PATH/third_party/torch_npu_ops/triton_npu/binary"
 
   log "Environment ready: ASCEND_RT_VISIBLE_DEVICES=$ASCEND_RT_VISIBLE_DEVICES"
+  log "Triton NPU binary path: TRITON_BINARY_PATH=$TRITON_BINARY_PATH"
 }
 
 parse_config_arg_first() {
@@ -555,6 +579,9 @@ parse_args() {
       --max-tokens-per-chunk-for-prefill) MAX_TOKENS_PER_CHUNK_FOR_PREFILL="$2"; shift 2 ;;
       --max-concurrent-requests) MAX_CONCURRENT_REQUESTS="$2"; shift 2 ;;
       --num-speculative-tokens) NUM_SPECULATIVE_TOKENS="$2"; shift 2 ;;
+      --healthcheck-timeout-seconds) HEALTHCHECK_TIMEOUT_SECONDS="$2"; shift 2 ;;
+      --healthcheck-interval-seconds) HEALTHCHECK_INTERVAL_SECONDS="$2"; shift 2 ;;
+      --smoke-test-timeout-seconds) SMOKE_TEST_TIMEOUT_SECONDS="$2"; shift 2 ;;
       -h|--help)
         cat <<'USAGE'
 Usage: scripts/launch_xllm.sh [options]
@@ -573,6 +600,8 @@ Common options:
   --nnodes N
   --master-node-addr HOST:PORT
   --run-dir DIR
+  --healthcheck-timeout-seconds SECONDS
+  --smoke-test-timeout-seconds SECONDS
 USAGE
         exit 0
         ;;
@@ -596,6 +625,9 @@ validate_config() {
   [[ "$NNODES" =~ ^[0-9]+$ ]] && (( NNODES > 0 )) || die "nnodes must be a positive integer: $NNODES"
   [[ "$START_PORT" =~ ^[0-9]+$ ]] || die "start_port must be an integer: $START_PORT"
   [[ "$START_DEVICE" =~ ^[0-9]+$ ]] || die "start_device must be an integer: $START_DEVICE"
+  [[ "$HEALTHCHECK_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] && (( HEALTHCHECK_TIMEOUT_SECONDS > 0 )) || die "healthcheck timeout must be a positive integer: $HEALTHCHECK_TIMEOUT_SECONDS"
+  [[ "$HEALTHCHECK_INTERVAL_SECONDS" =~ ^[0-9]+$ ]] && (( HEALTHCHECK_INTERVAL_SECONDS > 0 )) || die "healthcheck interval must be a positive integer: $HEALTHCHECK_INTERVAL_SECONDS"
+  [[ "$SMOKE_TEST_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] && (( SMOKE_TEST_TIMEOUT_SECONDS > 0 )) || die "smoke test timeout must be a positive integer: $SMOKE_TEST_TIMEOUT_SECONDS"
 }
 
 start_service() {
@@ -633,12 +665,14 @@ start_service() {
       --backend llm
     )
 
-    if [[ -n "$DRAFT_MODEL_PATH" ]]; then
+    if [[ -n "$DRAFT_MODEL_PATH" && "$NUM_SPECULATIVE_TOKENS" != "0" ]]; then
       CMD+=(
         --draft_model "$DRAFT_MODEL_PATH"
         --draft_devices "npu:$device"
         --num_speculative_tokens "$NUM_SPECULATIVE_TOKENS"
       )
+    elif [[ -n "$DRAFT_MODEL_PATH" ]]; then
+      log "MTP disabled for node_$i: draft_model_path is set but num_speculative_tokens=0"
     fi
 
     log "Starting node_$i: port=$port device=npu:$device log=$log_file"
@@ -646,14 +680,170 @@ start_service() {
     printf ' %q' "${CMD[@]}" >> "$log_file"
     printf '\n\n' >> "$log_file"
 
-    "${CMD[@]}" >> "$log_file" 2>&1 &
+    nohup "${CMD[@]}" >> "$log_file" 2>&1 &
     pid="$!"
     echo "$pid" >> "$LOG_DIR/pids.txt"
     log "node_$i pid=$pid"
   done
 
   log "Started $NNODES xllm process(es). Logs: $LOG_DIR"
-  log "Health check: curl http://127.0.0.1:$START_PORT/v1/models"
+  log "Health check URL: http://127.0.0.1:$START_PORT/v1/models"
+}
+
+all_processes_alive() {
+  local pid
+  while read -r pid; do
+    [[ -n "$pid" ]] || continue
+    kill -0 "$pid" >/dev/null 2>&1 || return 1
+  done < "$LOG_DIR/pids.txt"
+}
+
+extract_service_model_id() {
+  local models_file="$1"
+  local parsed=""
+
+  parsed="$(
+    sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$models_file" | head -n 1
+  )"
+
+  if [[ -n "$parsed" ]]; then
+    SERVICE_MODEL_ID="$parsed"
+  elif [[ -n "$MODEL_NAME" ]]; then
+    SERVICE_MODEL_ID="$MODEL_NAME"
+  else
+    SERVICE_MODEL_ID="$(basename "$MODEL_PATH")"
+  fi
+}
+
+wait_for_healthcheck() {
+  local url="http://127.0.0.1:$START_PORT/v1/models"
+  local deadline=$((SECONDS + HEALTHCHECK_TIMEOUT_SECONDS))
+  local attempt=0
+  local output="$LOG_DIR/healthcheck.log"
+  local body="$LOG_DIR/models.json"
+  local tmp="$LOG_DIR/healthcheck.tmp"
+
+  command -v curl >/dev/null 2>&1 || die "curl command not found"
+
+  log "Waiting for service readiness: url=$url timeout=${HEALTHCHECK_TIMEOUT_SECONDS}s interval=${HEALTHCHECK_INTERVAL_SECONDS}s"
+  : > "$output"
+
+  while (( SECONDS < deadline )); do
+    attempt=$((attempt + 1))
+    if ! all_processes_alive; then
+      HEALTHCHECK_STATUS="FAIL"
+      DEPLOY_STATUS="FAIL"
+      write_manifest
+      write_report
+      die "xllm process exited before health check passed; inspect $LOG_DIR/node_*.log"
+    fi
+
+    if curl -fsS --max-time 10 "$url" > "$tmp" 2>&1; then
+      mv "$tmp" "$body"
+      {
+        printf 'url=%s\n' "$url"
+        printf 'attempt=%s\n' "$attempt"
+        printf 'status=PASS\n\n'
+        cat "$body"
+        printf '\n'
+      } > "$output"
+      HEALTHCHECK_STATUS="PASS"
+      extract_service_model_id "$body"
+      log "Health check PASS: url=$url attempt=$attempt output=$output"
+      log "Service model id for smoke test: $SERVICE_MODEL_ID"
+      return 0
+    fi
+
+    {
+      printf 'url=%s\n' "$url"
+      printf 'attempt=%s\n' "$attempt"
+      printf 'status=WAITING\n\n'
+      cat "$tmp"
+      printf '\n'
+    } > "$output"
+    rm -f "$tmp"
+    log "Health check waiting: attempt=$attempt elapsed=${SECONDS}s"
+    sleep "$HEALTHCHECK_INTERVAL_SECONDS"
+  done
+
+  HEALTHCHECK_STATUS="FAIL"
+  DEPLOY_STATUS="FAIL"
+  write_manifest
+  write_report
+  die "health check timeout after ${HEALTHCHECK_TIMEOUT_SECONDS}s: $url; latest output: $output"
+}
+
+run_smoke_test() {
+  local url="http://127.0.0.1:$START_PORT/v1/chat/completions"
+  local output="$LOG_DIR/smoke_test.log"
+  local payload="$LOG_DIR/smoke_test.request.json"
+  local response="$LOG_DIR/smoke_test.response.json"
+  local escaped_model
+
+  escaped_model="$(printf '%s' "$SERVICE_MODEL_ID" | json_escape)"
+
+  cat > "$payload" <<EOF
+{
+  "model": "$escaped_model",
+  "max_tokens": 8,
+  "temperature": 0,
+  "stream": false,
+  "messages": [
+    {
+      "role": "user",
+      "content": "hello xllm"
+    }
+  ]
+}
+EOF
+
+  log "Running smoke test: POST $url model=$SERVICE_MODEL_ID timeout=${SMOKE_TEST_TIMEOUT_SECONDS}s"
+  if curl -fsS --max-time "$SMOKE_TEST_TIMEOUT_SECONDS" \
+      -H "Content-Type: application/json" \
+      -d @"$payload" \
+      "$url" > "$response" 2> "$output"; then
+    {
+      printf 'url=%s\n' "$url"
+      printf 'request=%s\n' "$payload"
+      printf 'response=%s\n' "$response"
+      printf 'status=PASS\n\n'
+      cat "$response"
+      printf '\n'
+    } >> "$output"
+    SMOKE_TEST_STATUS="PASS"
+    DEPLOY_STATUS="PASS"
+    log "Smoke test PASS: output=$output response=$response"
+    return 0
+  fi
+
+  SMOKE_TEST_STATUS="FAIL"
+  DEPLOY_STATUS="FAIL"
+  {
+    printf 'url=%s\n' "$url"
+    printf 'request=%s\n' "$payload"
+    printf 'response=%s\n' "$response"
+    printf 'status=FAIL\n'
+  } >> "$output"
+  write_manifest
+  write_report
+  die "smoke test failed: output=$output response=$response"
+}
+
+print_runtime_summary() {
+  log "Launch summary:"
+  log "  status=$DEPLOY_STATUS"
+  log "  healthcheck_status=$HEALTHCHECK_STATUS"
+  log "  smoke_test_status=$SMOKE_TEST_STATUS"
+  log "  service_url=http://127.0.0.1:$START_PORT"
+  log "  models_url=http://127.0.0.1:$START_PORT/v1/models"
+  log "  chat_url=http://127.0.0.1:$START_PORT/v1/chat/completions"
+  log "  service_model_id=${SERVICE_MODEL_ID:-unknown}"
+  log "  run_dir=$RUN_DIR"
+  log "  pids_file=$LOG_DIR/pids.txt"
+  log "  visible_devices_file=$LOG_DIR/visible_devices.txt"
+  log "  healthcheck_log=$LOG_DIR/healthcheck.log"
+  log "  smoke_test_log=$LOG_DIR/smoke_test.log"
+  log "  node_logs=$LOG_DIR/node_*.log"
 }
 
 main() {
@@ -691,6 +881,12 @@ main() {
 
   setup_environment
   start_service
+  wait_for_healthcheck
+  run_smoke_test
+  write_manifest
+  write_report
+  log "Updated deploy artifacts: manifest.json report.md healthcheck.log smoke_test.log"
+  print_runtime_summary
 }
 
 main "$@"

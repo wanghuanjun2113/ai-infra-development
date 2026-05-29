@@ -40,7 +40,7 @@ cd ai-infra-development
 bash scripts/launch_xllm.sh
 ```
 
-The single-purpose launcher is `scripts/launch_xllm.sh`. It reads `development.yaml`, creates `runs/deploy/<run_id>/`, selects idle devices, writes deployment artifacts, and starts xllm.
+The single-purpose launcher is `scripts/launch_xllm.sh`. It reads `development.yaml`, creates `runs/deploy/<run_id>/`, selects idle devices, writes deployment artifacts, starts xllm, waits for service readiness, and runs a simple smoke test.
 
 It is based on `/home/g00510989/xllm_whj/scripts/xllm.sh` and should:
 
@@ -49,6 +49,8 @@ It is based on `/home/g00510989/xllm_whj/scripts/xllm.sh` and should:
 3. Export runtime controls such as `ASCEND_RT_VISIBLE_DEVICES`, `PYTORCH_NPU_ALLOC_CONF`, `NPU_MEMORY_FRACTION`, `OMP_NUM_THREADS`, and HCCL settings.
 4. Start one xllm server process per configured node.
 5. Write logs to the deploy run directory as `node_0.log`, `node_1.log`, and so on.
+6. Wait for `GET /v1/models` to pass, save the response as `models.json`, and write `healthcheck.log`.
+7. Run a minimal `POST /v1/chat/completions` request and write `smoke_test.log`.
 
 Important default parameters are configured in `development.yaml` under `deploy.xllm`:
 
@@ -94,6 +96,14 @@ Health check one node with:
 curl http://127.0.0.1:{start_port}/v1/models
 ```
 
+Smoke test one node with:
+
+```bash
+curl http://127.0.0.1:{start_port}/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"<model-id-from-/v1/models>","max_tokens":8,"temperature":0,"stream":false,"messages":[{"role":"user","content":"hello xllm"}]}'
+```
+
 Direct launcher example:
 
 ```bash
@@ -108,7 +118,23 @@ Run benchmark cases from `development.yaml`. Preserve raw benchmark output, pars
 
 ## Accuracy
 
-Run fixed eval cases from `development.yaml`. Keep decoding parameters and seeds stable. Preserve raw predictions and failed cases.
+Run the single-file accuracy script after the service is ready:
+
+```bash
+python3 scripts/run_accuracy.py --level sanity
+python3 scripts/run_accuracy.py --level quick
+python3 scripts/run_accuracy.py --level full
+```
+
+Levels:
+
+- `sanity`: ask one simple question, print the question and response, and mark garbled output as failure.
+- `quick`: download/cache MMLU under the configured `datasets.mmlu.path`, sample a small set of public questions, finish within about 2 minutes, and print accuracy.
+- `full`: use a broader MMLU subject set, target about 1 hour by default, and write dataset/accuracy statistics.
+
+MMLU evaluation uses `/v1/completions` with a completion-style answer prefix. Avoid switching it to `/v1/chat/completions` unless the chat template is known to emit final option letters directly; otherwise thinking/explanation text can be truncated before the answer and corrupt answer parsing.
+
+Preserve raw predictions, failed cases, `manifest.json`, and `report.md` under `runs/accuracy/<run_id>/`.
 
 ## Known Issues
 

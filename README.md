@@ -44,7 +44,9 @@ python3 scripts/dev.py sync pull --framework xllm
 python3 scripts/dev.py run build --framework xllm
 bash scripts/launch_xllm.sh
 python3 scripts/dev.py run perf --framework xllm --case smoke
-python3 scripts/dev.py run accuracy --framework xllm --case ceval
+python3 scripts/run_accuracy.py --level sanity
+python3 scripts/run_accuracy.py --level quick
+python3 scripts/run_accuracy.py --level full
 ```
 
 ## 典型流程
