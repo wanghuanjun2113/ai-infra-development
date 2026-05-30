@@ -44,12 +44,13 @@ deploy:
   xllm:
     start_port: 18150
     nnodes: 2
-    max_memory_utilization: 0.7
+    max_memory_utilization: 0.6
     max_tokens_per_batch: 32768
     max_seqs_per_batch: 16
     block_size: 128
     communication_backend: lccl
-    max_tokens_per_chunk_for_prefill: 256
+    enable_chunked_prefill: true
+    max_tokens_per_chunk_for_prefill: 8192
     max_concurrent_requests: 30
     speculative_tokens: 0
 

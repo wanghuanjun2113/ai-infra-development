@@ -114,7 +114,54 @@ bash scripts/launch_xllm.sh \
 
 ## Performance
 
-Run benchmark cases from `development.yaml`. Preserve raw benchmark output, parsed metrics, and `npu-smi info` snapshots.
+Run the single-file performance script after the service is ready:
+
+```bash
+python3 scripts/run_perf.py --level simple
+python3 scripts/run_perf.py --level complex
+```
+
+Levels:
+
+- `simple`: short smoke-style performance coverage, capped at 5 minutes by default.
+- `complex`: broader performance coverage with larger prompts, longer outputs, and higher concurrency, capped at 30 minutes by default.
+
+The `simple` level runs these default cases:
+
+| Case | Input tokens | Output tokens | Concurrency |
+|---|---:|---:|---:|
+| `in128_out128_c1` | 128 | 128 | 1 |
+| `in128_out128_c16` | 128 | 128 | 16 |
+| `in2k_out1k_c1` | 2048 | 1024 | 1 |
+| `in2k_out1k_c16` | 2048 | 1024 | 16 |
+| `in8k_out1k_c1` | 8192 | 1024 | 1 |
+| `in32k_out1_c1` | 32768 | 1 | 1 |
+| `in128k_out1k_c1` | 131072 | 1024 | 1 |
+
+Each level runs multiple cases that vary synthetic input length, max output tokens, concurrency, request count, and synthetic data profile. Results are printed as a terminal table at the end of the run and written under `runs/perf/<run_id>/`:
+
+- `report.md`: human-readable summary table.
+- `result_table.txt`: the same terminal table printed on screen.
+- `summary.json`: parsed metrics per case.
+- `results.jsonl`: one row per request.
+- `failed.jsonl`: failed requests only.
+- `npu_smi_before.txt` and `npu_smi_after.txt`: device snapshots when `npu-smi info` is available.
+
+The script uses streaming `/v1/completions` requests so latency metrics include:
+
+- TTFT: time to first streamed token.
+- TPOT: time per output token after the first token.
+- E2E latency: end-to-end request latency.
+- Throughput: requests per second, output tokens per second, and total tokens per second.
+
+Each latency family reports average, P90, and P95 in `report.md` and `summary.json`.
+
+Common overrides:
+
+```bash
+python3 scripts/run_perf.py --level simple --case in128_out128_c1
+python3 scripts/run_perf.py --level complex --time-limit-seconds 900
+```
 
 ## Accuracy
 

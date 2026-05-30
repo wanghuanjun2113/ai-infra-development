@@ -23,6 +23,7 @@ MAX_TOKENS_PER_BATCH=32768
 MAX_SEQS_PER_BATCH=16
 BLOCK_SIZE=128
 COMMUNICATION_BACKEND="lccl"
+ENABLE_CHUNKED_PREFILL=true
 MAX_TOKENS_PER_CHUNK_FOR_PREFILL=256
 MAX_CONCURRENT_REQUESTS=30
 NUM_SPECULATIVE_TOKENS=2
@@ -259,6 +260,7 @@ load_config_defaults() {
   MAX_SEQS_PER_BATCH="$(yaml_get deploy.xllm.max_seqs_per_batch 16)"
   BLOCK_SIZE="$(yaml_get deploy.xllm.block_size 128)"
   COMMUNICATION_BACKEND="$(yaml_get deploy.xllm.communication_backend lccl)"
+  ENABLE_CHUNKED_PREFILL="$(yaml_get deploy.xllm.enable_chunked_prefill true)"
   MAX_TOKENS_PER_CHUNK_FOR_PREFILL="$(yaml_get deploy.xllm.max_tokens_per_chunk_for_prefill 256)"
   MAX_CONCURRENT_REQUESTS="$(yaml_get deploy.xllm.max_concurrent_requests 30)"
   NUM_SPECULATIVE_TOKENS="$(yaml_get deploy.xllm.speculative_tokens 2)"
@@ -286,6 +288,7 @@ print_config_summary() {
   log "  visible_devices=$VISIBLE_DEVICES"
   log "  start_device=$START_DEVICE start_port=$START_PORT nnodes=$NNODES"
   log "  master_node_addr=$MASTER_NODE_ADDR hccl_if_base_port=$HCCL_IF_BASE_PORT"
+  log "  enable_chunked_prefill=$ENABLE_CHUNKED_PREFILL max_tokens_per_chunk_for_prefill=$MAX_TOKENS_PER_CHUNK_FOR_PREFILL"
   log "  healthcheck_timeout_seconds=$HEALTHCHECK_TIMEOUT_SECONDS"
   log "  smoke_test_timeout_seconds=$SMOKE_TEST_TIMEOUT_SECONDS"
   log "  run_dir=$RUN_DIR"
@@ -654,7 +657,7 @@ start_service() {
       --block_size "$BLOCK_SIZE"
       --communication_backend "$COMMUNICATION_BACKEND"
       --enable_prefix_cache=false
-      --enable_chunked_prefill=false
+      --enable_chunked_prefill="$ENABLE_CHUNKED_PREFILL"
       --max_tokens_per_chunk_for_prefill "$MAX_TOKENS_PER_CHUNK_FOR_PREFILL"
       --enable_schedule_overlap=true
       --enable_graph=true
