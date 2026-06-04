@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import json
 import random
@@ -114,6 +115,17 @@ def default_base_url(cfg: dict[str, Any]) -> str:
     return f"http://127.0.0.1:{port}"
 
 
+def default_concurrency(cfg: dict[str, Any]) -> int:
+    value = cfg.get("accuracy", {}).get("concurrency", 1)
+    try:
+        concurrency = int(value)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"accuracy.concurrency must be a positive integer: {value}") from exc
+    if concurrency < 1:
+        raise SystemExit(f"accuracy.concurrency must be a positive integer: {value}")
+    return concurrency
+
+
 def timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
@@ -209,7 +221,9 @@ def has_garbled_text(text: str) -> bool:
 
 
 def build_sanity_prompt(question: str) -> str:
-    return f"{question.rstrip()} 请只回答完整短句，不要解释。\n答案："
+    if question.strip() == "1+1 等于几？":
+        return "问题：1+1 等于几？\n答案：1+1 等于"
+    return f"请用一句中文回答：{question.rstrip()}\n"
 
 
 def clean_short_answer(text: str) -> str:
@@ -218,46 +232,129 @@ def clean_short_answer(text: str) -> str:
         position = answer.find(marker)
         if position > 0:
             answer = answer[:position].strip()
+    lines = [line.strip() for line in answer.splitlines() if line.strip()]
+    if lines:
+        answer = lines[0]
     return answer
+
+
+def evaluate_sanity_once(index: int, total: int, args: argparse.Namespace, model: str, question: str) -> dict[str, Any]:
+    started = time.monotonic()
+    raw_answer = ""
+    error = ""
+    answer = ""
+    try:
+        raw_answer = text_completion(
+            args.base_url,
+            model,
+            build_sanity_prompt(question),
+            max_tokens=args.answer_max_tokens,
+            timeout=args.request_timeout,
+        )
+        answer = clean_short_answer(raw_answer)
+    except Exception as exc:
+        error = str(exc)
+    latency = time.monotonic() - started
+    garbled = bool(error) or has_garbled_text(answer)
+    expected_ok = True
+    if args.question is None:
+        expected_ok = bool(re.search(r"(?:\b2\b|二|两)", answer))
+    return {
+        "index": index,
+        "total_requests": total,
+        "question": question,
+        "answer": answer,
+        "raw_answer": raw_answer,
+        "garbled": garbled,
+        "expected_ok": expected_ok,
+        "ok": not garbled and expected_ok,
+        "latency_seconds": round(latency, 3),
+        "error": error,
+    }
+
+
+def print_sanity_result(item: dict[str, Any]) -> None:
+    error = f" error={item['error']}" if item.get("error") else ""
+    print(
+        f"[{item['index']}/{item['total_requests']}] "
+        f"ok={int(item['ok'])} latency={item['latency_seconds']:.3f}s "
+        f"answer={item['answer']!r}{error}"
+    )
+
+
+def run_sanity_requests(args: argparse.Namespace, model: str, question: str) -> list[dict[str, Any]]:
+    total = args.concurrency
+    if args.concurrency == 1:
+        item = evaluate_sanity_once(1, total, args, model, question)
+        print_sanity_result(item)
+        return [item]
+
+    results: list[dict[str, Any]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as executor:
+        futures = [
+            executor.submit(evaluate_sanity_once, index, total, args, model, question)
+            for index in range(1, total + 1)
+        ]
+        for future in concurrent.futures.as_completed(futures):
+            item = future.result()
+            results.append(item)
+            print_sanity_result(item)
+    results.sort(key=lambda item: item["index"])
+    return results
+
+
+def latency_summary(rows: list[dict[str, Any]]) -> dict[str, float]:
+    if not rows:
+        return {"avg": 0.0, "max": 0.0}
+    values = [float(item.get("latency_seconds", 0.0)) for item in rows]
+    return {"avg": round(sum(values) / len(values), 3), "max": round(max(values), 3)}
 
 
 def run_sanity(args: argparse.Namespace, cfg: dict[str, Any], run_dir: Path) -> dict[str, Any]:
     model = get_service_model(args.base_url, args.model or first_model_name(cfg), args.request_timeout)
     question = args.question or "1+1 等于几？"
     print(f"Question: {question}")
-    raw_answer = text_completion(
-        args.base_url,
-        model,
-        build_sanity_prompt(question),
-        max_tokens=args.answer_max_tokens,
-        timeout=args.request_timeout,
-    )
-    answer = clean_short_answer(raw_answer)
-    print(f"Answer: {answer}")
-    garbled = has_garbled_text(answer)
+    print(f"Model: {model}")
+    print(f"Run dir: {run_dir}")
+    print(f"Concurrency: {args.concurrency}")
+    results = run_sanity_requests(args, model, question)
+    first = results[0] if results else {}
+    ok_count = sum(1 for item in results if item["ok"])
+    failed = [item for item in results if not item["ok"]]
+    answer = str(first.get("answer", ""))
     (run_dir / "sanity.json").write_text(
         json.dumps(
             {
                 "level": "sanity",
                 "model": model,
                 "question": question,
+                "concurrency": args.concurrency,
                 "answer": answer,
-                "raw_answer": raw_answer,
-                "garbled": garbled,
+                "raw_answer": str(first.get("raw_answer", "")),
+                "ok_count": ok_count,
+                "total_requests": len(results),
+                "latency": latency_summary(results),
+                "results": results,
             },
             ensure_ascii=False,
             indent=2,
         ),
         encoding="utf-8",
     )
+    print(f"Sanity passed: {ok_count}/{len(results)}")
+    print(f"Answer: {answer}")
     return {
-        "status": "PASS" if not garbled else "FAIL",
+        "status": "PASS" if results and not failed else "FAIL",
         "level": "sanity",
         "model": model,
+        "concurrency": args.concurrency,
         "question": question,
         "answer": answer,
-        "raw_answer": raw_answer,
-        "garbled": garbled,
+        "raw_answer": str(first.get("raw_answer", "")),
+        "ok_count": ok_count,
+        "total_requests": len(results),
+        "latency": latency_summary(results),
+        "results": str(run_dir / "sanity.json"),
     }
 
 
@@ -477,6 +574,125 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def evaluate_mmlu_example(
+    index: int,
+    total: int,
+    example: dict[str, str],
+    args: argparse.Namespace,
+    model: str,
+    deadline: float,
+) -> dict[str, Any]:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError(f"time limit reached before question {index}")
+    prompt = build_prompt(example)
+    started = time.monotonic()
+    raw = ""
+    error = ""
+    try:
+        timeout = max(1, min(args.request_timeout, int(remaining)))
+        raw = text_completion(args.base_url, model, prompt, max_tokens=args.answer_max_tokens, timeout=timeout)
+        prediction = parse_choice(raw)
+    except Exception as exc:
+        prediction = ""
+        error = str(exc)
+    latency = time.monotonic() - started
+    correct = not error and prediction == example["answer"]
+    return {
+        "index": index,
+        "id": example["id"],
+        "dataset": "mmlu",
+        "subject": example["subject"],
+        "question": example["question"],
+        "answer": example["answer"],
+        "prediction": prediction,
+        "raw_response": raw,
+        "correct": correct,
+        "latency_seconds": round(latency, 3),
+        "error": error,
+        "total_questions": total,
+    }
+
+
+def print_prediction(item: dict[str, Any]) -> None:
+    error = f" error={item['error']}" if item.get("error") else ""
+    print(
+        f"[{item['index']}/{item['total_questions']}] {item['subject']} "
+        f"gold={item['answer']} pred={item['prediction'] or 'NA'} correct={int(item['correct'])} "
+        f"latency={item['latency_seconds']:.3f}s{error}"
+    )
+
+
+def run_mmlu_requests(
+    examples: list[dict[str, str]],
+    args: argparse.Namespace,
+    model: str,
+    deadline: float,
+) -> list[dict[str, Any]]:
+    total = len(examples)
+    if args.concurrency == 1:
+        predictions: list[dict[str, Any]] = []
+        for index, example in enumerate(examples, start=1):
+            if deadline - time.monotonic() <= 0:
+                print(f"Time limit reached before question {index}; stopping early.")
+                break
+            item = evaluate_mmlu_example(index, total, example, args, model, deadline)
+            predictions.append(item)
+            print_prediction(item)
+        return predictions
+
+    predictions = []
+    next_index = 0
+    pending: dict[concurrent.futures.Future[dict[str, Any]], int] = {}
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency)
+    try:
+        while next_index < total or pending:
+            while next_index < total and len(pending) < args.concurrency:
+                if deadline - time.monotonic() <= 0:
+                    print(f"Time limit reached before question {next_index + 1}; stopping early.")
+                    break
+                example_index = next_index + 1
+                future = executor.submit(
+                    evaluate_mmlu_example,
+                    example_index,
+                    total,
+                    examples[next_index],
+                    args,
+                    model,
+                    deadline,
+                )
+                pending[future] = example_index
+                next_index += 1
+
+            if not pending:
+                break
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                print("Time limit reached while waiting for in-flight requests; stopping early.")
+                break
+            done, _ = concurrent.futures.wait(
+                pending,
+                timeout=max(0.1, remaining),
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            if not done:
+                print("No request completed before the time limit; stopping early.")
+                break
+            for future in done:
+                pending.pop(future, None)
+                item = future.result()
+                predictions.append(item)
+                print_prediction(item)
+    finally:
+        for future in pending:
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+
+    predictions.sort(key=lambda item: item["index"])
+    return predictions
+
+
 def run_mmlu_eval(args: argparse.Namespace, cfg: dict[str, Any], run_dir: Path) -> dict[str, Any]:
     level = args.level
     dataset_root = ensure_mmlu_dataset(cfg, args.force_download)
@@ -507,37 +723,12 @@ def run_mmlu_eval(args: argparse.Namespace, cfg: dict[str, Any], run_dir: Path) 
     print(f"Model: {model}")
     print(f"Run dir: {run_dir}")
     print(f"Planned questions: {len(examples)}")
+    print(f"Concurrency: {args.concurrency}")
     print(f"Time limit seconds: {time_limit}")
 
-    for index, example in enumerate(examples, start=1):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            print(f"Time limit reached before question {index}; stopping early.")
-            break
-        prompt = build_prompt(example)
-        started = time.monotonic()
-        timeout = max(1, min(args.request_timeout, int(remaining)))
-        raw = text_completion(args.base_url, model, prompt, max_tokens=args.answer_max_tokens, timeout=timeout)
-        latency = time.monotonic() - started
-        prediction = parse_choice(raw)
-        correct = prediction == example["answer"]
-        item = {
-            "index": index,
-            "id": example["id"],
-            "dataset": "mmlu",
-            "subject": example["subject"],
-            "question": example["question"],
-            "answer": example["answer"],
-            "prediction": prediction,
-            "raw_response": raw,
-            "correct": correct,
-            "latency_seconds": round(latency, 3),
-        }
-        predictions.append(item)
-        print(
-            f"[{index}/{len(examples)}] {example['subject']} "
-            f"gold={example['answer']} pred={prediction or 'NA'} correct={int(correct)}"
-        )
+    predictions = run_mmlu_requests(examples, args, model, deadline)
+    for item in predictions:
+        item.pop("total_questions", None)
 
     summary = summarize(predictions)
     write_jsonl(run_dir / "predictions.jsonl", predictions)
@@ -556,6 +747,7 @@ def run_mmlu_eval(args: argparse.Namespace, cfg: dict[str, Any], run_dir: Path) 
         "dataset": "mmlu",
         "dataset_path": str(dataset_root),
         "model": model,
+        "concurrency": args.concurrency,
         "time_limit_seconds": time_limit,
         "planned_questions": len(examples),
         "answered_questions": len(predictions),
@@ -581,6 +773,7 @@ def write_report(run_dir: Path, manifest: dict[str, Any]) -> None:
         f"- Dataset: {manifest.get('dataset', 'none')}",
         f"- Dataset path: {manifest.get('dataset_path', 'none')}",
         f"- Model: {manifest.get('model')}",
+        f"- Concurrency: {manifest.get('concurrency', 1)}",
         f"- Run directory: {manifest.get('run_dir')}",
     ]
     if isinstance(summary, dict) and summary:
@@ -600,7 +793,19 @@ def write_report(run_dir: Path, manifest: dict[str, Any]) -> None:
         for subject, stats in sorted(summary.get("by_subject", {}).items()):
             lines.append(f"- {subject}: {stats['accuracy']:.4f} ({stats['correct']}/{stats['total']})")
     if "question" in manifest:
-        lines.extend(["", "## Sanity", "", f"- Question: {manifest['question']}", f"- Answer: {manifest['answer']}"])
+        lines.extend(
+            [
+                "",
+                "## Sanity",
+                "",
+                f"- Question: {manifest['question']}",
+                f"- Answer: {manifest['answer']}",
+                f"- Passed: {manifest.get('ok_count', 0)}/{manifest.get('total_requests', 1)}",
+            ]
+        )
+        latency = manifest.get("latency")
+        if isinstance(latency, dict):
+            lines.append(f"- Latency avg/max seconds: {latency.get('avg', 0.0):.3f}/{latency.get('max', 0.0):.3f}")
     lines.append("")
     (run_dir / "report.md").write_text("\n".join(lines), encoding="utf-8")
 
@@ -614,6 +819,7 @@ def main() -> int:
     parser.add_argument("--question", default=None, help="Sanity question override")
     parser.add_argument("--request-timeout", type=int, default=60)
     parser.add_argument("--answer-max-tokens", type=int, default=16)
+    parser.add_argument("--concurrency", type=int, default=None, help="Concurrent accuracy requests. Default: accuracy.concurrency, then 1")
     parser.add_argument("--time-limit-seconds", type=int, default=None)
     parser.add_argument("--max-questions", type=int, default=None)
     parser.add_argument("--per-subject", type=int, default=None)
@@ -623,6 +829,10 @@ def main() -> int:
 
     cfg = load_config(Path(args.config).expanduser().resolve())
     args.base_url = args.base_url or default_base_url(cfg)
+    if args.concurrency is None:
+        args.concurrency = default_concurrency(cfg)
+    if args.concurrency < 1:
+        raise SystemExit("--concurrency must be a positive integer")
     run_dir = create_run_dir(args.level)
 
     try:

@@ -52,14 +52,34 @@ It is based on `/home/g00510989/xllm_whj/scripts/xllm.sh` and should:
 6. Wait for `GET /v1/models` to pass, save the response as `models.json`, and write `healthcheck.log`.
 7. Run a minimal `POST /v1/chat/completions` request and write `smoke_test.log`.
 
-Important default parameters are configured in `development.yaml` under `deploy.xllm`:
+Key deployment features are configured in `development.yaml` under `deploy.xllm`; lower-level server knobs stay as launcher defaults unless there is a repeated need to expose them:
 
 ```yaml
+model: qwen35_27b
+draft_model: qwen35_27b_mtp
 visible_devices: auto
-start_device: 0
 start_port: 18150
-nnodes: 2
-master_node_addr: 127.0.0.1:22345
+enable_prefix_cache: false
+speculative_tokens: 0
+tp_size: 2
+dp_size: 1
+ep_size: 1
+enable_chunked_prefill: true
+max_tokens_per_chunk_for_prefill: 8192
+max_memory_utilization: 0.85
+max_sequence_length: model_default
+max_tokens_per_batch: 2048
+max_seqs_per_batch: 1
+```
+
+Model paths stay in `models`; `deploy.xllm.model` and `deploy.xllm.draft_model` reference those entries:
+
+```yaml
+models:
+  qwen35_27b:
+    path: /home/data/weights/Qwen35-27B
+  qwen35_27b_mtp:
+    path: /home/data/weights/Qwen35-27B-mtp
 ```
 
 Each node starts with the same core server arguments:
@@ -70,16 +90,19 @@ Each node starts with the same core server arguments:
 --port $PORT
 --master_node_addr=$MASTER_NODE_ADDR
 --nnodes=$NNODES
---max_memory_utilization=0.7
---max_tokens_per_batch=32768
---max_seqs_per_batch=16
+--max_memory_utilization=$MAX_MEMORY_UTILIZATION
+--max_tokens_per_batch=$MAX_TOKENS_PER_BATCH
+--max_seqs_per_batch=$MAX_SEQS_PER_BATCH
 --block_size=128
 --communication_backend="lccl"
---enable_prefix_cache=false
---enable_chunked_prefill=false
---max_tokens_per_chunk_for_prefill=256
+--enable_prefix_cache=$ENABLE_PREFIX_CACHE
+--enable_chunked_prefill=$ENABLE_CHUNKED_PREFILL
+--max_tokens_per_chunk_for_prefill=$MAX_TOKENS_PER_CHUNK_FOR_PREFILL
 --enable_schedule_overlap=true
 --enable_graph=true
+--dp_size=$DP_SIZE
+--ep_size=$EP_SIZE
+--tp_size=$TP_SIZE
 --node_rank=$i
 --enable_shm=0
 --task="generate"
@@ -87,8 +110,10 @@ Each node starts with the same core server arguments:
 --backend llm
 --draft_model $DRAFT_MODEL_PATH
 --draft_devices="npu:$DEVICE"
---num_speculative_tokens 2
+--num_speculative_tokens $NUM_SPECULATIVE_TOKENS
 ```
+
+`max_sequence_length` is printed and written to launch artifacts. The current xllm server build does not expose a matching gflag for LLM serving, so runtime maximum position length still comes from the model config when this value is `model_default`.
 
 Health check one node with:
 
@@ -163,6 +188,39 @@ python3 scripts/run_perf.py --level simple --case in128_out128_c1
 python3 scripts/run_perf.py --level complex --time-limit-seconds 900
 ```
 
+## Profiling
+
+Use `scripts/capture_xllm_profile.sh` to attach Ascend `msprof` to an
+already-running xllm process. The profiling script does not start xllm; start
+xllm with the normal launcher first:
+
+```bash
+bash scripts/launch_xllm.sh
+```
+
+The current launcher exports `PROFILING_MODE=dynamic`, which is required for
+dynamic `msprof --pid` attach. Use the xllm parent PID from the deploy run:
+
+```bash
+head -n 1 runs/deploy/<run_id>/pids.txt
+```
+
+Capture a warmup request outside the profiling window, then capture the measured
+workload:
+
+```bash
+bash scripts/capture_xllm_profile.sh \
+  --pid "$(head -n 1 runs/deploy/<run_id>/pids.txt)" \
+  --output-dir profiling/<run_id> \
+  --warmup-cmd "python3 scripts/run_perf.py --level simple --case in128_out128_c1" \
+  --workload-cmd "python3 scripts/run_perf.py --level simple --case in2k_out1k_c1"
+```
+
+The script writes `capture.log`, `msprof.log`, `workload.log`, `manifest.json`,
+`npu_smi_before.txt`, `npu_smi_after.txt`, and exported `PROF_*` data under the
+profiling run directory. Keep prefill-focused and decode-focused captures in
+separate directories.
+
 ## Accuracy
 
 Run the single-file accuracy script after the service is ready:
@@ -171,6 +229,7 @@ Run the single-file accuracy script after the service is ready:
 python3 scripts/run_accuracy.py --level sanity
 python3 scripts/run_accuracy.py --level quick
 python3 scripts/run_accuracy.py --level full
+python3 scripts/run_accuracy.py --level quick --concurrency 4
 ```
 
 Levels:
@@ -178,6 +237,7 @@ Levels:
 - `sanity`: ask one simple question, print the question and response, and mark garbled output as failure.
 - `quick`: download/cache MMLU under the configured `datasets.mmlu.path`, sample a small set of public questions, finish within about 2 minutes, and print accuracy.
 - `full`: use a broader MMLU subject set, target about 1 hour by default, and write dataset/accuracy statistics.
+- `--concurrency`: run multiple accuracy requests at the same time. The default is `accuracy.concurrency` in `development.yaml`, which is `1` unless changed.
 
 MMLU evaluation uses `/v1/completions` with a completion-style answer prefix. Avoid switching it to `/v1/chat/completions` unless the chat template is known to emit final option letters directly; otherwise thinking/explanation text can be truncated before the answer and corrupt answer parsing.
 

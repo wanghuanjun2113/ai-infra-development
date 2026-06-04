@@ -17,7 +17,9 @@ bash scripts/bootstrap.sh
 - 配置各框架的 Git 仓库地址和默认分支。
 - 配置当前工作框架。
 - 配置测试和部署使用的模型路径、数据集路径。
-- 配置部署参数、性能测试 case、精度测试 case。
+- 配置部署关键特性、性能测试 case、精度测试 case。
+
+xllm 的部署关键特性集中在 `deploy.xllm`，例如 prefix cache、投机步数、TP/DP/EP、chunk prefill、显存占比和 batch 上限；其他底层启动项由 `scripts/launch_xllm.sh` 使用默认值。
 
 ## 目录结构
 
@@ -48,6 +50,7 @@ python3 scripts/run_perf.py --level complex
 python3 scripts/run_accuracy.py --level sanity
 python3 scripts/run_accuracy.py --level quick
 python3 scripts/run_accuracy.py --level full
+python3 scripts/run_accuracy.py --level quick --concurrency 4
 ```
 
 ## 典型流程

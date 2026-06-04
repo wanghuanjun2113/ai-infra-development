@@ -9,24 +9,34 @@ REPO_PATH=""
 SERVER_BIN=""
 MODEL_NAME=""
 MODEL_PATH=""
+DRAFT_MODEL_NAME=""
 DRAFT_MODEL_PATH=""
 VISIBLE_DEVICES="auto"
 START_DEVICE=0
 START_PORT=18150
-NNODES=2
+NNODES=""
+NNODES_EXPLICIT=false
 MASTER_NODE_ADDR="127.0.0.1:22345"
 HCCL_IF_BASE_PORT=43433
 LOG_DIR="log"
 RUN_DIR=""
 MAX_MEMORY_UTILIZATION=0.7
+MAX_SEQUENCE_LENGTH="model_default"
 MAX_TOKENS_PER_BATCH=32768
 MAX_SEQS_PER_BATCH=16
 BLOCK_SIZE=128
 COMMUNICATION_BACKEND="lccl"
+ENABLE_PREFIX_CACHE=false
 ENABLE_CHUNKED_PREFILL=true
+ENABLE_SCHEDULE_OVERLAP=true
+ENABLE_GRAPH=true
 MAX_TOKENS_PER_CHUNK_FOR_PREFILL=256
 MAX_CONCURRENT_REQUESTS=30
 NUM_SPECULATIVE_TOKENS=2
+TP_SIZE=1
+DP_SIZE=1
+EP_SIZE=1
+MAX_LINEAR_STATE_CACHE_SLOTS=0
 GIT_BRANCH="unknown"
 GIT_COMMIT="unknown"
 LAUNCH_LOG=""
@@ -246,23 +256,36 @@ load_config_defaults() {
 
   if [[ -n "$MODEL_NAME" ]]; then
     MODEL_PATH="$(yaml_get "models.$MODEL_NAME.path" "")"
+  fi
+  DRAFT_MODEL_NAME="$(yaml_get deploy.xllm.draft_model "")"
+  if [[ -n "$DRAFT_MODEL_NAME" ]]; then
+    DRAFT_MODEL_PATH="$(yaml_get "models.$DRAFT_MODEL_NAME.path" "")"
+  elif [[ -n "$MODEL_NAME" ]]; then
     DRAFT_MODEL_PATH="$(yaml_get "models.$MODEL_NAME.draft_model_path" "")"
   fi
 
   VISIBLE_DEVICES="$(yaml_get deploy.xllm.visible_devices auto)"
   START_DEVICE="$(yaml_get deploy.xllm.start_device 0)"
   START_PORT="$(yaml_get deploy.xllm.start_port 18150)"
-  NNODES="$(yaml_get deploy.xllm.nnodes 2)"
+  TP_SIZE="$(yaml_get deploy.xllm.tp_size 1)"
+  DP_SIZE="$(yaml_get deploy.xllm.dp_size 1)"
+  EP_SIZE="$(yaml_get deploy.xllm.ep_size 1)"
+  NNODES="$(yaml_get deploy.xllm.nnodes "")"
+  if [[ -z "$NNODES" ]]; then
+    NNODES=$((TP_SIZE * DP_SIZE))
+  else
+    NNODES_EXPLICIT=true
+  fi
   MASTER_NODE_ADDR="$(yaml_get deploy.xllm.master_node_addr 127.0.0.1:22345)"
   HCCL_IF_BASE_PORT="$(yaml_get deploy.xllm.hccl_if_base_port 43433)"
   MAX_MEMORY_UTILIZATION="$(yaml_get deploy.xllm.max_memory_utilization 0.7)"
+  MAX_SEQUENCE_LENGTH="$(yaml_get deploy.xllm.max_sequence_length model_default)"
   MAX_TOKENS_PER_BATCH="$(yaml_get deploy.xllm.max_tokens_per_batch 32768)"
   MAX_SEQS_PER_BATCH="$(yaml_get deploy.xllm.max_seqs_per_batch 16)"
-  BLOCK_SIZE="$(yaml_get deploy.xllm.block_size 128)"
-  COMMUNICATION_BACKEND="$(yaml_get deploy.xllm.communication_backend lccl)"
+  ENABLE_PREFIX_CACHE="$(yaml_get deploy.xllm.enable_prefix_cache false)"
   ENABLE_CHUNKED_PREFILL="$(yaml_get deploy.xllm.enable_chunked_prefill true)"
   MAX_TOKENS_PER_CHUNK_FOR_PREFILL="$(yaml_get deploy.xllm.max_tokens_per_chunk_for_prefill 256)"
-  MAX_CONCURRENT_REQUESTS="$(yaml_get deploy.xllm.max_concurrent_requests 30)"
+  MAX_LINEAR_STATE_CACHE_SLOTS="$(yaml_get deploy.xllm.max_linear_state_cache_slots 0)"
   NUM_SPECULATIVE_TOKENS="$(yaml_get deploy.xllm.speculative_tokens 2)"
 
   if git -C "$REPO_PATH" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -284,11 +307,21 @@ print_config_summary() {
   log "  server_bin=$SERVER_BIN"
   log "  model_name=$MODEL_NAME"
   log "  model_path=$MODEL_PATH"
+  log "  draft_model_name=${DRAFT_MODEL_NAME:-none}"
   log "  draft_model_path=$DRAFT_MODEL_PATH"
   log "  visible_devices=$VISIBLE_DEVICES"
   log "  start_device=$START_DEVICE start_port=$START_PORT nnodes=$NNODES"
   log "  master_node_addr=$MASTER_NODE_ADDR hccl_if_base_port=$HCCL_IF_BASE_PORT"
-  log "  enable_chunked_prefill=$ENABLE_CHUNKED_PREFILL max_tokens_per_chunk_for_prefill=$MAX_TOKENS_PER_CHUNK_FOR_PREFILL"
+  log "  key: enable_prefix_cache=$ENABLE_PREFIX_CACHE"
+  log "  key: draft_model=${DRAFT_MODEL_NAME:-none} draft_model_path=${DRAFT_MODEL_PATH:-none} speculative_tokens=$NUM_SPECULATIVE_TOKENS"
+  log "  key: tp_size=$TP_SIZE dp_size=$DP_SIZE ep_size=$EP_SIZE"
+  log "  key: enable_chunked_prefill=$ENABLE_CHUNKED_PREFILL max_tokens_per_chunk_for_prefill=$MAX_TOKENS_PER_CHUNK_FOR_PREFILL"
+  log "  key: max_memory_utilization=$MAX_MEMORY_UTILIZATION"
+  log "  key: max_sequence_length=$MAX_SEQUENCE_LENGTH"
+  log "  key: max_tokens_per_batch=$MAX_TOKENS_PER_BATCH max_seqs_per_batch=$MAX_SEQS_PER_BATCH"
+  log "  key: max_linear_state_cache_slots=$MAX_LINEAR_STATE_CACHE_SLOTS"
+  log "  default: block_size=$BLOCK_SIZE communication_backend=$COMMUNICATION_BACKEND"
+  log "  default: enable_schedule_overlap=$ENABLE_SCHEDULE_OVERLAP enable_graph=$ENABLE_GRAPH max_concurrent_requests=$MAX_CONCURRENT_REQUESTS"
   log "  healthcheck_timeout_seconds=$HEALTHCHECK_TIMEOUT_SECONDS"
   log "  smoke_test_timeout_seconds=$SMOKE_TEST_TIMEOUT_SECONDS"
   log "  run_dir=$RUN_DIR"
@@ -392,14 +425,16 @@ select_idle_devices() {
 
 write_manifest() {
   local manifest="$LOG_DIR/manifest.json"
-  local repo_json branch_json commit_json model_json model_path_json draft_json bin_json visible_json start_device_json start_port_json nnodes_json master_json run_json
+  local repo_json branch_json commit_json model_json model_path_json draft_model_json draft_json bin_json visible_json start_device_json start_port_json nnodes_json master_json run_json
   local status_json health_json smoke_json service_model_json
+  local prefix_json spec_json tp_json dp_json ep_json chunk_json chunk_tokens_json memory_json max_sequence_json max_tokens_json max_seqs_json linear_slots_json
 
   repo_json="$(printf '%s' "$REPO_PATH" | json_escape)"
   branch_json="$(printf '%s' "$GIT_BRANCH" | json_escape)"
   commit_json="$(printf '%s' "$GIT_COMMIT" | json_escape)"
   model_json="$(printf '%s' "$MODEL_NAME" | json_escape)"
   model_path_json="$(printf '%s' "$MODEL_PATH" | json_escape)"
+  draft_model_json="$(printf '%s' "$DRAFT_MODEL_NAME" | json_escape)"
   draft_json="$(printf '%s' "$DRAFT_MODEL_PATH" | json_escape)"
   bin_json="$(printf '%s' "$SERVER_BIN" | json_escape)"
   visible_json="$(printf '%s' "$VISIBLE_DEVICES" | json_escape)"
@@ -412,13 +447,40 @@ write_manifest() {
   health_json="$(printf '%s' "$HEALTHCHECK_STATUS" | json_escape)"
   smoke_json="$(printf '%s' "$SMOKE_TEST_STATUS" | json_escape)"
   service_model_json="$(printf '%s' "$SERVICE_MODEL_ID" | json_escape)"
+  prefix_json="$(printf '%s' "$ENABLE_PREFIX_CACHE" | json_escape)"
+  spec_json="$(printf '%s' "$NUM_SPECULATIVE_TOKENS" | json_escape)"
+  tp_json="$(printf '%s' "$TP_SIZE" | json_escape)"
+  dp_json="$(printf '%s' "$DP_SIZE" | json_escape)"
+  ep_json="$(printf '%s' "$EP_SIZE" | json_escape)"
+  chunk_json="$(printf '%s' "$ENABLE_CHUNKED_PREFILL" | json_escape)"
+  chunk_tokens_json="$(printf '%s' "$MAX_TOKENS_PER_CHUNK_FOR_PREFILL" | json_escape)"
+  memory_json="$(printf '%s' "$MAX_MEMORY_UTILIZATION" | json_escape)"
+  max_sequence_json="$(printf '%s' "$MAX_SEQUENCE_LENGTH" | json_escape)"
+  max_tokens_json="$(printf '%s' "$MAX_TOKENS_PER_BATCH" | json_escape)"
+  max_seqs_json="$(printf '%s' "$MAX_SEQS_PER_BATCH" | json_escape)"
+  linear_slots_json="$(printf '%s' "$MAX_LINEAR_STATE_CACHE_SLOTS" | json_escape)"
 
   cat > "$manifest" <<EOF
 {
   "branch": "$branch_json",
   "commit": "$commit_json",
+  "draft_model": "$draft_model_json",
   "draft_model_path": "$draft_json",
   "framework": "xllm",
+  "key_config": {
+    "enable_prefix_cache": "$prefix_json",
+    "speculative_tokens": "$spec_json",
+    "tp_size": "$tp_json",
+    "dp_size": "$dp_json",
+    "ep_size": "$ep_json",
+    "enable_chunked_prefill": "$chunk_json",
+    "max_tokens_per_chunk_for_prefill": "$chunk_tokens_json",
+    "max_memory_utilization": "$memory_json",
+    "max_sequence_length": "$max_sequence_json",
+    "max_tokens_per_batch": "$max_tokens_json",
+    "max_seqs_per_batch": "$max_seqs_json",
+    "max_linear_state_cache_slots": "$linear_slots_json"
+  },
   "master_node_addr": "$master_json",
   "model": "$model_json",
   "model_path": "$model_path_json",
@@ -453,10 +515,21 @@ $DEPLOY_STATUS
 - Branch: $GIT_BRANCH
 - Commit: $GIT_COMMIT
 - Model: $MODEL_PATH
+- Draft model name: ${DRAFT_MODEL_NAME:-none}
 - Draft model: $DRAFT_MODEL_PATH
 - Visible devices: $VISIBLE_DEVICES
 - Start port: $START_PORT
 - Nodes: $NNODES
+- Prefix cache: $ENABLE_PREFIX_CACHE
+- Speculative tokens: $NUM_SPECULATIVE_TOKENS
+- TP/DP/EP: $TP_SIZE/$DP_SIZE/$EP_SIZE
+- Chunk prefill: $ENABLE_CHUNKED_PREFILL
+- Max tokens per chunk for prefill: $MAX_TOKENS_PER_CHUNK_FOR_PREFILL
+- Max memory utilization: $MAX_MEMORY_UTILIZATION
+- Max sequence length: $MAX_SEQUENCE_LENGTH
+- Max tokens per batch: $MAX_TOKENS_PER_BATCH
+- Max sequences per batch: $MAX_SEQS_PER_BATCH
+- Max linear state cache slots: $MAX_LINEAR_STATE_CACHE_SLOTS
 - Run directory: $RUN_DIR
 - Health check: $HEALTHCHECK_STATUS
 - Smoke test: $SMOKE_TEST_STATUS
@@ -569,7 +642,7 @@ parse_args() {
       --visible-devices) VISIBLE_DEVICES="$2"; shift 2 ;;
       --start-device) START_DEVICE="$2"; shift 2 ;;
       --start-port) START_PORT="$2"; shift 2 ;;
-      --nnodes) NNODES="$2"; shift 2 ;;
+      --nnodes) NNODES="$2"; NNODES_EXPLICIT=true; shift 2 ;;
       --master-node-addr) MASTER_NODE_ADDR="$2"; shift 2 ;;
       --hccl-if-base-port) HCCL_IF_BASE_PORT="$2"; shift 2 ;;
       --log-dir) RUN_DIR="$2"; LOG_DIR="$2"; shift 2 ;;
@@ -577,11 +650,18 @@ parse_args() {
       --max-memory-utilization) MAX_MEMORY_UTILIZATION="$2"; shift 2 ;;
       --max-tokens-per-batch) MAX_TOKENS_PER_BATCH="$2"; shift 2 ;;
       --max-seqs-per-batch) MAX_SEQS_PER_BATCH="$2"; shift 2 ;;
+      --max-sequence-length) MAX_SEQUENCE_LENGTH="$2"; shift 2 ;;
       --block-size) BLOCK_SIZE="$2"; shift 2 ;;
       --communication-backend) COMMUNICATION_BACKEND="$2"; shift 2 ;;
+      --enable-prefix-cache) ENABLE_PREFIX_CACHE="$2"; shift 2 ;;
+      --enable-chunked-prefill) ENABLE_CHUNKED_PREFILL="$2"; shift 2 ;;
       --max-tokens-per-chunk-for-prefill) MAX_TOKENS_PER_CHUNK_FOR_PREFILL="$2"; shift 2 ;;
       --max-concurrent-requests) MAX_CONCURRENT_REQUESTS="$2"; shift 2 ;;
+      --max-linear-state-cache-slots) MAX_LINEAR_STATE_CACHE_SLOTS="$2"; shift 2 ;;
       --num-speculative-tokens) NUM_SPECULATIVE_TOKENS="$2"; shift 2 ;;
+      --tp-size) TP_SIZE="$2"; shift 2 ;;
+      --dp-size) DP_SIZE="$2"; shift 2 ;;
+      --ep-size) EP_SIZE="$2"; shift 2 ;;
       --healthcheck-timeout-seconds) HEALTHCHECK_TIMEOUT_SECONDS="$2"; shift 2 ;;
       --healthcheck-interval-seconds) HEALTHCHECK_INTERVAL_SECONDS="$2"; shift 2 ;;
       --smoke-test-timeout-seconds) SMOKE_TEST_TIMEOUT_SECONDS="$2"; shift 2 ;;
@@ -605,6 +685,12 @@ Common options:
   --run-dir DIR
   --healthcheck-timeout-seconds SECONDS
   --smoke-test-timeout-seconds SECONDS
+
+Key feature options can also be set in development.yaml under deploy.xllm:
+  draft_model, enable_prefix_cache, speculative_tokens, tp_size, dp_size, ep_size,
+  enable_chunked_prefill, max_tokens_per_chunk_for_prefill,
+  max_memory_utilization, max_sequence_length, max_tokens_per_batch,
+  max_seqs_per_batch.
 USAGE
         exit 0
         ;;
@@ -618,6 +704,9 @@ USAGE
     RUN_DIR="$ROOT_DIR/$RUN_DIR"
     LOG_DIR="$RUN_DIR"
   fi
+  if [[ "$NNODES_EXPLICIT" == "false" ]]; then
+    NNODES=$((TP_SIZE * DP_SIZE))
+  fi
 }
 
 validate_config() {
@@ -626,8 +715,23 @@ validate_config() {
   [[ -n "$MODEL_PATH" ]] || die "missing model path; configure benchmark.model or deploy.xllm.model"
   [[ -x "$SERVER_BIN" ]] || die "xllm server binary not found or not executable: $SERVER_BIN; build xllm first with: python setup.py build"
   [[ "$NNODES" =~ ^[0-9]+$ ]] && (( NNODES > 0 )) || die "nnodes must be a positive integer: $NNODES"
+  [[ "$TP_SIZE" =~ ^[0-9]+$ ]] && (( TP_SIZE > 0 )) || die "tp_size must be a positive integer: $TP_SIZE"
+  [[ "$DP_SIZE" =~ ^[0-9]+$ ]] && (( DP_SIZE > 0 )) || die "dp_size must be a positive integer: $DP_SIZE"
+  [[ "$EP_SIZE" =~ ^[0-9]+$ ]] && (( EP_SIZE > 0 )) || die "ep_size must be a positive integer: $EP_SIZE"
+  (( TP_SIZE * DP_SIZE == NNODES )) || die "tp_size * dp_size must equal nnodes: tp_size=$TP_SIZE dp_size=$DP_SIZE nnodes=$NNODES"
+  [[ "$ENABLE_PREFIX_CACHE" == "true" || "$ENABLE_PREFIX_CACHE" == "false" ]] || die "enable_prefix_cache must be true or false: $ENABLE_PREFIX_CACHE"
+  [[ "$ENABLE_CHUNKED_PREFILL" == "true" || "$ENABLE_CHUNKED_PREFILL" == "false" ]] || die "enable_chunked_prefill must be true or false: $ENABLE_CHUNKED_PREFILL"
   [[ "$START_PORT" =~ ^[0-9]+$ ]] || die "start_port must be an integer: $START_PORT"
   [[ "$START_DEVICE" =~ ^[0-9]+$ ]] || die "start_device must be an integer: $START_DEVICE"
+  [[ "$MAX_TOKENS_PER_BATCH" =~ ^[0-9]+$ ]] && (( MAX_TOKENS_PER_BATCH > 0 )) || die "max_tokens_per_batch must be a positive integer: $MAX_TOKENS_PER_BATCH"
+  [[ "$MAX_SEQS_PER_BATCH" =~ ^[0-9]+$ ]] && (( MAX_SEQS_PER_BATCH > 0 )) || die "max_seqs_per_batch must be a positive integer: $MAX_SEQS_PER_BATCH"
+  [[ "$MAX_SEQUENCE_LENGTH" == "model_default" || "$MAX_SEQUENCE_LENGTH" =~ ^[0-9]+$ ]] || die "max_sequence_length must be model_default or a non-negative integer: $MAX_SEQUENCE_LENGTH"
+  if [[ "$MAX_SEQUENCE_LENGTH" != "model_default" ]]; then
+    log "WARN: max_sequence_length=$MAX_SEQUENCE_LENGTH is recorded in launch artifacts; this xllm server build uses the model config for runtime max position length."
+  fi
+  [[ "$MAX_TOKENS_PER_CHUNK_FOR_PREFILL" =~ ^-?[0-9]+$ ]] || die "max_tokens_per_chunk_for_prefill must be an integer: $MAX_TOKENS_PER_CHUNK_FOR_PREFILL"
+  [[ "$MAX_LINEAR_STATE_CACHE_SLOTS" =~ ^[0-9]+$ ]] || die "max_linear_state_cache_slots must be a non-negative integer: $MAX_LINEAR_STATE_CACHE_SLOTS"
+  [[ "$NUM_SPECULATIVE_TOKENS" =~ ^[0-9]+$ ]] || die "speculative_tokens must be a non-negative integer: $NUM_SPECULATIVE_TOKENS"
   [[ "$HEALTHCHECK_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] && (( HEALTHCHECK_TIMEOUT_SECONDS > 0 )) || die "healthcheck timeout must be a positive integer: $HEALTHCHECK_TIMEOUT_SECONDS"
   [[ "$HEALTHCHECK_INTERVAL_SECONDS" =~ ^[0-9]+$ ]] && (( HEALTHCHECK_INTERVAL_SECONDS > 0 )) || die "healthcheck interval must be a positive integer: $HEALTHCHECK_INTERVAL_SECONDS"
   [[ "$SMOKE_TEST_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] && (( SMOKE_TEST_TIMEOUT_SECONDS > 0 )) || die "smoke test timeout must be a positive integer: $SMOKE_TEST_TIMEOUT_SECONDS"
@@ -656,15 +760,19 @@ start_service() {
       --max_seqs_per_batch "$MAX_SEQS_PER_BATCH"
       --block_size "$BLOCK_SIZE"
       --communication_backend "$COMMUNICATION_BACKEND"
-      --enable_prefix_cache=false
+      --enable_prefix_cache="$ENABLE_PREFIX_CACHE"
       --enable_chunked_prefill="$ENABLE_CHUNKED_PREFILL"
       --max_tokens_per_chunk_for_prefill "$MAX_TOKENS_PER_CHUNK_FOR_PREFILL"
-      --enable_schedule_overlap=true
-      --enable_graph=true
+      --enable_schedule_overlap="$ENABLE_SCHEDULE_OVERLAP"
+      --enable_graph="$ENABLE_GRAPH"
+      --dp_size "$DP_SIZE"
+      --ep_size "$EP_SIZE"
+      --tp_size "$TP_SIZE"
       --node_rank "$i"
       --enable_shm=0
       --task generate
       --max_concurrent_requests "$MAX_CONCURRENT_REQUESTS"
+      --max_linear_state_cache_slots "$MAX_LINEAR_STATE_CACHE_SLOTS"
       --backend llm
     )
 

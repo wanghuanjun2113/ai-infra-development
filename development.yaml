@@ -30,7 +30,8 @@ frameworks:
 models:
   qwen35_27b:
     path: /home/data/weights/Qwen35-27B
-    draft_model_path: /home/data/weights/Qwen35-27B-mtp
+  qwen35_27b_mtp:
+    path: /home/data/weights/Qwen35-27B-mtp
 
 datasets:
   ceval:
@@ -42,17 +43,23 @@ datasets:
 
 deploy:
   xllm:
+    model: qwen35_27b
+    draft_model: qwen35_27b_mtp
+    visible_devices: auto
     start_port: 18150
-    nnodes: 2
-    max_memory_utilization: 0.6
-    max_tokens_per_batch: 32768
-    max_seqs_per_batch: 16
-    block_size: 128
-    communication_backend: lccl
+
+    enable_prefix_cache: false
+    speculative_tokens: 0
+    tp_size: 2
+    dp_size: 1
+    ep_size: 1
     enable_chunked_prefill: true
     max_tokens_per_chunk_for_prefill: 8192
-    max_concurrent_requests: 30
-    speculative_tokens: 0
+    max_memory_utilization: 0.85
+    max_sequence_length: model_default
+    max_tokens_per_batch: 2048
+    max_seqs_per_batch: 16
+    max_linear_state_cache_slots: 4
 
 benchmark:
   model: qwen35_27b
@@ -71,6 +78,7 @@ benchmark:
 
 accuracy:
   model: qwen35_27b
+  concurrency: 1
   cases:
     - name: ceval
       dataset: ceval
